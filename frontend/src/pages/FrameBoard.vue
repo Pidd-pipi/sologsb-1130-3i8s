@@ -7,9 +7,10 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
+import { useLedgerStore } from '../stores/ledgerStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useLocalDraft } from '../hooks/useLocalDraft';
-import { durationToFrames, framesToDuration } from '../utils/frameMath';
+import { framesToDuration } from '../utils/frameMath';
 import { APERTURE_OPTIONS, EXPOSURE_OPTIONS, ISO_OPTIONS, SHUTTER_ANGLE_OPTIONS } from '../utils/exposure';
 import type { BatchExposure, FrameEntry } from '../types/frame';
 import type { Shot } from '../types/shot';
@@ -20,13 +21,13 @@ import StatusTag from '../components/common/StatusTag.vue';
 
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
+const ledgerStore = useLedgerStore();
 const { shots } = storeToRefs(shotStore);
 const { frames, selectedFrameNo } = storeToRefs(frameStore);
 const { insertAfter, removeAt, move, patch, select, syncShotRange, totalDuration, fps } = useFrameSequence();
 
 const activeShotId = ref<number | null>(null);
-const feedback = ref('');
-const newFrame = ref<Partial<FrameEntry>>({
+const feedback = ref('');const newFrame = ref<Partial<FrameEntry>>({
   shotCount: 2,
   exposureSec: 0.25,
   aperture: 5.6,
@@ -45,8 +46,13 @@ const { draft: batch, reset: resetBatch } = useLocalDraft<BatchExposure>('frame-
 });
 
 const activeShot = computed<Shot | undefined>(() => (activeShotId.value === null ? undefined : shotStore.byId(activeShotId.value)));
-const planned = computed(() => (activeShot.value ? durationToFrames(activeShot.value.durationSec, activeShot.value.fps) : 0));
+const shotStat = computed(() => (activeShotId.value === null ? undefined : ledgerStore.shotStat(activeShotId.value)));
 const ordered = computed(() => frames.value.slice().sort((a, b) => a.frameNo - b.frameNo));
+const cellLedgers = computed(() => {
+  const map: Record<string, ReturnType<typeof ledgerStore.ledgerOfUid>> = {};
+  for (const f of ordered.value) map[f.uid] = ledgerStore.ledgerOfUid(f.uid);
+  return map;
+});
 const exposureOptions = EXPOSURE_OPTIONS;
 const apertureOptions = APERTURE_OPTIONS;
 const isoOptions = ISO_OPTIONS;
@@ -54,6 +60,7 @@ const shutterOptions = SHUTTER_ANGLE_OPTIONS;
 
 onMounted(async () => {
   if (!shotStore.ready) await shotStore.load();
+  if (!ledgerStore.ready) await ledgerStore.load();
   const first = shots.value[0];
   if (first && typeof first.id === 'number') {
     activeShotId.value = first.id;
@@ -62,7 +69,10 @@ onMounted(async () => {
 });
 
 watch(activeShotId, async (id) => {
-  if (typeof id === 'number') await frameStore.loadForShot(id);
+  if (typeof id === 'number') {
+    await frameStore.loadForShot(id);
+    await ledgerStore.reloadFrames(id);
+  }
 });
 
 function flash(text: string) {
@@ -85,11 +95,11 @@ async function doInsert() {
 
 async function doRemove() {
   if (selectedFrameNo.value === null) {
-    flash('请先点选要删除的帧');
+    flash('请先点选要移除的格子');
     return;
   }
   await removeAt(selectedFrameNo.value);
-  flash('已删除该帧并重排序号');
+  flash('格子已移出条带：已拍好张保留进补拍清单，位次已重排');
 }
 
 async function doReorder(from: number, to: number) {
@@ -152,8 +162,9 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
 
       <div class="stat-row">
         <div class="stat"><span class="label">镜号</span><span class="value small mono">{{ activeShot.code }}</span></div>
-        <div class="stat"><span class="label">条带帧数</span><span class="value">{{ frames.length }}</span></div>
-        <div class="stat"><span class="label">计划张数</span><span class="value">{{ planned }}</span></div>
+        <div class="stat"><span class="label">条带格子</span><span class="value">{{ frames.length }}</span></div>
+        <div class="stat"><span class="label">计划张数</span><span class="value">{{ shotStat?.required ?? 0 }}</span></div>
+        <div class="stat"><span class="label">待拍 / 废片</span><span class="value small">{{ shotStat?.remaining ?? 0 }} / {{ shotStat?.wasted ?? 0 }}</span></div>
         <div class="stat"><span class="label">当前时长</span><span class="value small">{{ totalDuration }} s</span></div>
         <div class="stat"><span class="label">帧率</span><span class="value small">{{ fps }} fps</span></div>
       </div>
@@ -162,12 +173,19 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <div class="panel-head">
           <h2>帧序条带</h2>
           <div class="head-actions">
-            <button type="button" class="btn small" data-testid="board-insert" @click="doInsert">插入帧</button>
-            <button type="button" class="btn small danger" data-testid="board-remove" @click="doRemove">删除选中帧</button>
+            <button type="button" class="btn small" data-testid="board-insert" @click="doInsert">插入格</button>
+            <button type="button" class="btn small danger" data-testid="board-remove" @click="doRemove">移除选中格</button>
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
-        <FrameStrip :frames="ordered" :selected="selectedFrameNo" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+        <FrameStrip
+          :frames="ordered"
+          :selected="selectedFrameNo"
+          :ledgers="cellLedgers"
+          @update:selected="select"
+          @reorder="doReorder"
+          @patch="patchFrame"
+        />
       </div>
 
       <div class="two-panel">
@@ -213,19 +231,20 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>帧序明细</h2><span class="muted">可上下移动单帧，序号自动重排</span></div>
+        <div class="panel-head"><h2>格子明细</h2><span class="muted">可上下移动单格，位次自动重排（uid 不变）；格内张数与台账请到镜头详情调整</span></div>
         <table class="table" data-testid="board-table">
           <thead>
-            <tr><th>位次</th><th>帧号</th><th>张数</th><th>曝光 s</th><th>光圈</th><th>ISO</th><th>位移 mm</th><th>操作</th></tr>
+            <tr><th>位次</th><th>格名</th><th>张数</th><th>已拍</th><th>废片</th><th>待拍</th><th>曝光 s</th><th>位移 mm</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(frame, index) in ordered" :key="frame.id ?? index" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
+            <tr v-for="(frame, index) in ordered" :key="frame.uid" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
               <td>{{ index + 1 }}</td>
-              <td class="mono">{{ frame.frameNo }}</td>
+              <td class="mono">{{ frame.label }}</td>
               <td>{{ frame.shotCount }} 张</td>
+              <td>{{ cellLedgers[frame.uid].taken }}</td>
+              <td :class="{ warn: cellLedgers[frame.uid].wasted > 0 }">{{ cellLedgers[frame.uid].wasted }}</td>
+              <td :class="{ done: cellLedgers[frame.uid].remaining === 0 }">{{ cellLedgers[frame.uid].remaining }}</td>
               <td>{{ frame.exposureSec }}</td>
-              <td>f/{{ frame.aperture }}</td>
-              <td>{{ frame.iso }}</td>
               <td>{{ frame.propOffsetMm }}</td>
               <td class="row-actions">
                 <button type="button" class="btn tiny" :disabled="index === 0" @click.stop="shiftFrame(frame, -1)">上移</button>
@@ -376,6 +395,12 @@ h1 {
 .muted {
   color: #8a94a6;
   font-size: 12px;
+}
+.warn {
+  color: #b36a00;
+}
+.done {
+  color: #227a52;
 }
 .row-actions {
   display: flex;

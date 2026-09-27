@@ -1,40 +1,41 @@
 <script setup lang="ts">
 /**
- * 镜头详情：上部镜头参数与进度，中部帧序条带，
- * 下部帧条目表格与道具轨迹；可就地插入帧、修改曝光或登记实拍。
- * 消费 Shot、FrameEntry、PropState、TakeLog 四个模型。
+ * 镜头详情：上部镜头参数与逐帧台账进度，中部帧序条带（每格显示已拍/废片/待拍），
+ * 下部逐格台账表格（含逐格登记、张数调整、格名修改、移除格子），
+ * 以及道具轨迹与本格实拍流水。
+ * 消费 Shot、FrameEntry、PropState、TakeLog、PickupItem 五个模型。
  */
 import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
+import { useLedgerStore } from '../stores/ledgerStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
-import { useProgress } from '../hooks/useProgress';
 import * as api from '../db/api';
-import { durationToFrames, estimateSpeed, framesToDuration } from '../utils/frameMath';
+import { estimateSpeed, framesToDuration } from '../utils/frameMath';
 import { FIXATION_OPTIONS, type Fixation, type PropState } from '../types/prop';
 import { SHOT_STATUS_OPTIONS, type ShotStatus } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
-import { SHOT_COUNT_OPTIONS } from '../types/frame';
-import { today } from '../utils/format';
+import { formatDateTime } from '../utils/format';
 import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
+import RegisterTakeForm from '../components/common/RegisterTakeForm.vue';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
+import { PICKUP_REASON_LABEL } from '../types/take';
 
 const route = useRoute();
 const router = useRouter();
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
+const ledgerStore = useLedgerStore();
 const { frames, selectedFrameNo } = storeToRefs(frameStore);
 
 const { insertAfter, removeAt, move, patch, select, syncShotRange } = useFrameSequence();
-const { registerTake, summaries, loadTakes, computeProgress } = useProgress();
 
 const props = ref<PropState[]>([]);
-const takeForm = ref({ date: today(), takenFrames: 8, wastedFrames: 0 });
 const propForm = ref({ name: '', fromFrame: 1, toFrame: 12, posX: 0, posY: 0, posZ: 0, rotation: 0, fixation: '支架' as Fixation });
 const exposureDraft = ref<Partial<FrameEntry>>({});
 const feedback = ref('');
@@ -42,17 +43,34 @@ const notFound = ref(false);
 
 const shotId = computed(() => Number(route.params.id));
 const shot = computed(() => shotStore.byId(shotId.value));
-const planned = computed(() => (shot.value ? durationToFrames(shot.value.durationSec, shot.value.fps) : 0));
-const summary = computed(() => summaries.value.find((s) => s.shotId === shotId.value));
+const stat = computed(() => ledgerStore.shotStat(shotId.value));
 const sceneProgress = computed(() =>
-  shot.value ? framesToDuration(shot.value.endFrame - shot.value.startFrame + 1, shot.value.fps) : 0,
+  shot.value ? framesToDuration(frames.value.length, shot.value.fps) : 0,
 );
 const statusOptions = SHOT_STATUS_OPTIONS;
 const fixationOptions = FIXATION_OPTIONS;
-const shotCountOptions = SHOT_COUNT_OPTIONS;
+
+/** uid → 单格台账，供条带与表格渲染 */
+const cellLedgers = computed(() => {
+  const map: Record<string, ReturnType<typeof ledgerStore.ledgerOfUid>> = {};
+  for (const f of frames.value) map[f.uid] = ledgerStore.ledgerOfUid(f.uid);
+  return map;
+});
+
+const shotTakes = computed(() =>
+  ledgerStore.takes
+    .filter((t) => t.shotId === shotId.value)
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.id ?? 0) - (a.id ?? 0))),
+);
+
+const shotPickups = computed(() => ledgerStore.openPickups.filter((p) => p.shotId === shotId.value));
+
+const selectedFrame = computed(() => frames.value.find((f) => f.frameNo === selectedFrameNo.value) ?? null);
+const selectedUid = computed(() => selectedFrame.value?.uid ?? null);
 
 async function bootstrap(id: number) {
   if (!shotStore.ready) await shotStore.load();
+  if (!ledgerStore.ready) await ledgerStore.load();
   const row = await api.getShot(id);
   if (!row) {
     notFound.value = true;
@@ -60,7 +78,7 @@ async function bootstrap(id: number) {
   }
   notFound.value = false;
   await frameStore.loadForShot(id);
-  await loadTakes();
+  await ledgerStore.reloadFrames(id);
   props.value = await api.listProps(id);
   if (typeof row.id === 'number') shotStore.currentId = row.id;
   const first = frames.value[0];
@@ -96,32 +114,25 @@ async function changeStatus(status: ShotStatus) {
   flash(`拍摄状态已更新为「${status}」`);
 }
 
-async function changeDuration(value: number) {
-  if (!shot.value) return;
-  await shotStore.update(shotId.value, { durationSec: value });
-  flash('已按新时长重排帧区间');
-}
-
 async function changeFps(value: number) {
   if (!shot.value) return;
   await shotStore.update(shotId.value, { fps: value });
   await syncShotRange();
-  flash('已按新帧率重排帧区间');
+  flash('已按新帧率重算镜头时长');
 }
 
 async function addFrameWithExposure() {
-  await insertAfter(selectedFrameNo.value ?? frames.value[frames.value.length - 1]?.frameNo ?? null);
-  const last = frames.value[frames.value.length - 1];
-  if (last) {
-    await patch(last.frameNo, exposureDraft.value as Partial<FrameEntry>);
-    select(last.frameNo);
-  }
-  flash('已在帧序中插入一帧');
+  const created = await insertAfter(
+    selectedFrameNo.value ?? frames.value[frames.value.length - 1]?.frameNo ?? null,
+    exposureDraft.value as Partial<FrameEntry>,
+  );
+  if (created) select(created.frameNo);
+  flash('已在帧序中插入一格');
 }
 
 async function reorder(from: number, to: number) {
   await move(from, to);
-  flash('已移动帧并重排序号');
+  flash('已移动格子并重排序号（uid 不变，实拍记录仍对回原格）');
 }
 
 async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
@@ -133,22 +144,27 @@ async function editCell(frame: FrameEntry, key: keyof FrameEntry, raw: string, n
   await patch(frame.frameNo, { [key]: value } as Partial<FrameEntry>);
 }
 
-async function removeFrameRow(frameNo: number) {
-  await removeAt(frameNo);
-  flash('已删除该帧并重排序号');
+async function editLabel(frame: FrameEntry, raw: string) {
+  await ledgerStore.renameCell(frame, raw);
+  await frameStore.refresh(shotId.value);
 }
 
-async function submitTake() {
-  if (!shot.value) return;
-  const taken = Math.max(0, Math.floor(takeForm.value.takenFrames));
-  const wasted = Math.max(0, Math.floor(takeForm.value.wastedFrames));
-  if (taken <= 0) {
-    flash('实拍张数需大于 0');
-    return;
-  }
-  await registerTake(shot.value, takeForm.value.date, taken, wasted);
-  await loadTakes();
-  flash(`已登记 ${taken} 张实拍，进度已回写`);
+async function changeCount(frame: FrameEntry, raw: string) {
+  const value = Math.max(1, Math.floor(Number(raw)));
+  if (!Number.isFinite(value)) return;
+  const before = frame.shotCount;
+  await ledgerStore.changeCellCount(frame, value);
+  await frameStore.refresh(shotId.value);
+  if (value < before) flash(`该格张数下调为 ${value}，超量好张已留进补拍清单`);
+}
+
+async function removeFrameRow(frameNo: number) {
+  await removeAt(frameNo);
+  flash('格子已从条带移除：位次已重排，已拍好张保留进补拍清单，历史记录不删除');
+}
+
+function onRegistered(payload: { frame: FrameEntry; taken: number; wasted: number }) {
+  flash(`已登记到「${payload.frame.label}」：实拍 ${payload.taken} 张（废片 ${payload.wasted}），该格/镜头/总览进度已重算`);
 }
 
 async function addProp() {
@@ -187,16 +203,27 @@ function propsAtFrame(frameNo: number): PropState[] {
 }
 
 const selectedProps = computed(() => (selectedFrameNo.value === null ? [] : propsAtFrame(selectedFrameNo.value)));
-const takeRows = computed(() => summaries.value.find((s) => s.shotId === shotId.value));
-const consumed = computed(() => {
-  const s = takeRows.value;
-  if (s) return computeProgress(s.planned, s.taken, s.wasted);
-  const plan = planned.value;
-  return { planned: plan, taken: 0, wasted: 0, remaining: plan, percent: 0 };
-});
 
 function speedOf(frame: FrameEntry) {
   return estimateSpeed(frame.propOffsetMm, shot.value?.fps ?? 24);
+}
+
+async function deleteTake(id: number | undefined) {
+  if (typeof id !== 'number') return;
+  await ledgerStore.removeTake(id);
+  flash('已删除该条登记，进度与补拍清单已重算');
+}
+
+async function resolvePickup(id: number | undefined) {
+  if (typeof id !== 'number') return;
+  await ledgerStore.resolvePickup(id);
+  flash('补拍条目已核销归档');
+}
+
+/** 表格里的「登记」：选中该格并把页面带到逐格登记表单 */
+function focusRegister(frame: FrameEntry) {
+  select(frame.frameNo);
+  document.querySelector<HTMLElement>('[data-testid="register-form"]')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 </script>
 
@@ -205,14 +232,15 @@ function speedOf(frame: FrameEntry) {
     <header class="page-head">
       <div>
         <h1>
-          镜头详情
+          逐帧拍摄台账
           <span v-if="shot" class="mono">{{ shot.code }}</span>
         </h1>
-        <p class="sub" v-if="shot">{{ shot.sceneName }} · {{ shot.fps }} fps · 帧区间 {{ shot.startFrame }} – {{ shot.endFrame }}</p>
+        <p class="sub" v-if="shot">{{ shot.sceneName }} · {{ shot.fps }} fps · 条带 {{ frames.length }} 格</p>
       </div>
       <div class="head-actions">
         <StatusTag v-if="shot" :status="shot.status" />
         <button type="button" class="btn" @click="router.push('/frames')">去帧序编排台</button>
+        <button type="button" class="btn" @click="router.push('/progress')">实拍记录/补拍</button>
         <button type="button" class="btn" @click="router.push('/')">返回总览</button>
       </div>
     </header>
@@ -242,22 +270,7 @@ function speedOf(frame: FrameEntry) {
                 </select>
               </dd>
             </div>
-            <div>
-              <dt>预计时长</dt>
-              <dd>
-                <input
-                  type="number"
-                  min="0.5"
-                  max="60"
-                  step="0.5"
-                  :value="shot.durationSec"
-                  data-testid="detail-duration"
-                  @change="changeDuration(Number(($event.target as HTMLInputElement).value))"
-                />
-                s
-              </dd>
-            </div>
-            <div><dt>帧区间</dt><dd class="mono">{{ shot.startFrame }} – {{ shot.endFrame }}（{{ sceneProgress }} s）</dd></div>
+            <div><dt>条带格子数</dt><dd class="mono">{{ frames.length }} 格（{{ sceneProgress }} s）</dd></div>
             <div><dt>负责人</dt><dd>{{ shot.owner || '未指派' }}</dd></div>
             <div>
               <dt>拍摄状态</dt>
@@ -268,32 +281,39 @@ function speedOf(frame: FrameEntry) {
               </dd>
             </div>
           </dl>
-          <ShotProgress
-            :code="shot.code"
-            :status="shot.status"
-            :planned="consumed.planned"
-            :taken="consumed.taken"
-            :wasted="consumed.wasted"
-            :remaining="consumed.remaining"
-            :percent="consumed.percent"
-          />
+          <div>
+            <ShotProgress
+              :code="shot.code"
+              :status="shot.status"
+              :planned="stat.required"
+              :taken="stat.good"
+              :wasted="stat.wasted"
+              :remaining="stat.remaining"
+              :percent="stat.percent"
+            />
+            <p class="muted sub-line">
+              已拍齐 {{ stat.doneFrames }}/{{ stat.totalFrames }} 格 · 实拍 {{ stat.taken }} 张（含废片 {{ stat.wasted }}）
+              <template v-if="stat.excess > 0"> · 超量好张 <strong class="warn">{{ stat.excess }}</strong> 在补拍清单</template>
+            </p>
+          </div>
         </div>
       </div>
 
       <div class="panel">
         <div class="panel-head">
           <h2>帧序条带</h2>
-          <span class="muted">点击色块选中该帧，可查看道具位置与就地改参数</span>
+          <span class="muted">每格显示 已拍/废片/待拍；点击选中后可逐格登记或改参数</span>
         </div>
         <FrameStrip
           :frames="frames"
           :selected="selectedFrameNo"
+          :ledgers="cellLedgers"
           @update:selected="select"
           @reorder="reorder"
           @patch="patchFrame"
         />
         <div v-if="selectedFrameNo !== null" class="prop-lookup" data-testid="prop-lookup">
-          <strong>第 {{ selectedFrameNo }} 帧道具位置：</strong>
+          <strong>第 {{ selectedFrameNo }} 格道具位置：</strong>
           <span v-if="!selectedProps.length" class="muted">该帧区间内没有已登记道具</span>
           <span v-for="p in selectedProps" :key="p.id" class="chip">
             {{ p.name }} ({{ p.posX }}, {{ p.posY }}, {{ p.posZ }}) mm · 旋转 {{ p.rotation }}°
@@ -301,115 +321,180 @@ function speedOf(frame: FrameEntry) {
         </div>
       </div>
 
-      <div class="panel">
+      <div v-if="shotPickups.length" class="panel pickup-panel">
         <div class="panel-head">
-          <h2>帧条目表格</h2>
-          <div class="head-actions">
-            <button type="button" class="btn small" data-testid="insert-frame" @click="addFrameWithExposure">插入帧</button>
-            <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
-          </div>
+          <h2>本镜头补拍清单（{{ shotPickups.length }}）</h2>
+          <span class="muted">超量好张不会消失，核销前一直挂账</span>
         </div>
-
-        <table v-if="frames.length" class="table" data-testid="frame-table">
+        <table class="table" data-testid="detail-pickup-table">
           <thead>
-            <tr>
-              <th>帧号</th>
-              <th>张数</th>
-              <th>曝光 s</th>
-              <th>光圈</th>
-              <th>ISO</th>
-              <th>快门角</th>
-              <th>灯光</th>
-              <th>位移 mm</th>
-              <th>位移速度</th>
-              <th>操作</th>
-            </tr>
+            <tr><th>格子</th><th>原因</th><th>超量好张</th><th>状态</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="frame in frames" :key="frame.id ?? frame.frameNo" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
-              <td class="mono">{{ frame.frameNo }}</td>
-              <td>
-                <select :value="frame.shotCount" @change="editCell(frame, 'shotCount', ($event.target as HTMLSelectElement).value)">
-                  <option v-for="c in shotCountOptions" :key="c" :value="c">{{ c }}</option>
-                </select>
-              </td>
-              <td><input type="number" min="0.008" max="8" step="0.008" :value="frame.exposureSec" @change="editCell(frame, 'exposureSec', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="1.4" max="22" step="0.1" :value="frame.aperture" @change="editCell(frame, 'aperture', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="100" max="3200" step="100" :value="frame.iso" @change="editCell(frame, 'iso', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="45" max="360" step="1" :value="frame.shutterAngle" @change="editCell(frame, 'shutterAngle', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="text" maxlength="20" :value="frame.lighting" @change="editCell(frame, 'lighting', ($event.target as HTMLInputElement).value, false)" /></td>
-              <td><input type="number" min="-200" max="200" step="0.5" :value="frame.propOffsetMm" @change="editCell(frame, 'propOffsetMm', ($event.target as HTMLInputElement).value)" /></td>
-              <td class="muted">{{ speedOf(frame) }} mm/s</td>
-              <td class="row-actions">
-                <button type="button" class="btn tiny" @click.stop="insertAfter(frame.frameNo)">后插</button>
-                <button type="button" class="btn tiny danger" :disabled="frames.length <= 1" @click.stop="removeFrameRow(frame.frameNo)">删除</button>
-              </td>
+            <tr v-for="p in shotPickups" :key="p.id">
+              <td>{{ p.frameLabel }}<span v-if="p.reason === 'removed'" class="tag">已移除</span></td>
+              <td>{{ PICKUP_REASON_LABEL[p.reason] }}</td>
+              <td class="warn strong">{{ p.liveExcess }} 张</td>
+              <td class="muted">{{ p.reason === 'removed' ? '固定快照' : '随计划实时重算' }}</td>
+              <td><button type="button" class="btn tiny" @click="resolvePickup(p.id)">核销归档</button></td>
             </tr>
           </tbody>
         </table>
-        <EmptyState v-else title="该镜头还没有帧条目" description="点击「插入帧」按当前曝光参数生成第一帧。" action-text="插入帧" @action="addFrameWithExposure" />
       </div>
 
       <div class="two-panel">
         <div class="panel">
           <div class="panel-head">
-            <h2>插入帧曝光参数</h2>
-            <span class="muted">插入后自动重排帧序号并联动帧区间</span>
+            <h2>逐格登记实拍</h2>
+            <span class="muted">废片自动重新计入该格待拍</span>
           </div>
-          <ExposureForm v-model="exposureDraft" :fps="shot.fps" />
+          <RegisterTakeForm
+            v-if="frames.length"
+            :shot="shot"
+            :frames="frames"
+            :preselect-uid="selectedUid"
+            @registered="onRegistered"
+          />
+          <EmptyState v-else title="条带上还没有格子" description="先在下方帧条目表格插入一格，再逐格登记。" />
         </div>
 
         <div class="panel">
           <div class="panel-head">
-            <h2>登记实拍</h2>
-            <span class="muted">剩余 {{ consumed.remaining }} 张</span>
+            <h2>插入格曝光参数</h2>
+            <span class="muted">插入后自动重排位次并联动镜头时长</span>
           </div>
-          <div class="take-form">
-            <label class="field"><span>拍摄日期</span><input v-model="takeForm.date" type="date" data-testid="take-date" /></label>
-            <label class="field"><span>实拍张数</span><input v-model.number="takeForm.takenFrames" type="number" min="1" max="2000" step="1" data-testid="take-taken" /></label>
-            <label class="field"><span>废帧数</span><input v-model.number="takeForm.wastedFrames" type="number" min="0" max="500" step="1" data-testid="take-wasted" /></label>
-            <button type="button" class="btn primary" data-testid="take-submit" @click="submitTake">登记并回写进度</button>
+          <ExposureForm v-model="exposureDraft" :fps="shot.fps" />
+          <div class="actions">
+            <button type="button" class="btn primary" data-testid="insert-frame" @click="addFrameWithExposure">在选中格后插入</button>
+            <button type="button" class="btn" @click="syncShotRange">重算时长</button>
           </div>
         </div>
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>道具轨迹</h2><span class="muted">按帧区间登记道具位置，条带上按帧号可查</span></div>
-        <div class="prop-form">
-          <label class="field"><span>道具名</span><input v-model="propForm.name" type="text" maxlength="20" data-testid="prop-name" /></label>
-          <label class="field"><span>起始帧</span><input v-model.number="propForm.fromFrame" type="number" min="1" step="1" data-testid="prop-from" /></label>
-          <label class="field"><span>结束帧</span><input v-model.number="propForm.toFrame" type="number" min="1" step="1" data-testid="prop-to" /></label>
-          <label class="field"><span>X mm</span><input v-model.number="propForm.posX" type="number" step="0.5" /></label>
-          <label class="field"><span>Y mm</span><input v-model.number="propForm.posY" type="number" step="0.5" /></label>
-          <label class="field"><span>Z mm</span><input v-model.number="propForm.posZ" type="number" step="0.5" /></label>
-          <label class="field"><span>旋转 °</span><input v-model.number="propForm.rotation" type="number" step="1" /></label>
-          <label class="field">
-            <span>固定方式</span>
-            <select v-model="propForm.fixation">
-              <option v-for="f in fixationOptions" :key="f" :value="f">{{ f }}</option>
-            </select>
-          </label>
-          <button type="button" class="btn primary" data-testid="prop-submit" @click="addProp">登记道具</button>
+        <div class="panel-head">
+          <h2>逐帧台账表格</h2>
+          <span class="muted">每格按自己的张数记账；张数下调或移除格子，超量好张进上方补拍清单</span>
         </div>
 
-        <table v-if="props.length" class="table" data-testid="prop-table">
+        <table v-if="frames.length" class="table" data-testid="frame-table">
           <thead>
-            <tr><th>道具</th><th>帧区间</th><th>X</th><th>Y</th><th>Z</th><th>旋转</th><th>固定</th><th>操作</th></tr>
+            <tr>
+              <th>位次</th>
+              <th>格名</th>
+              <th>该格张数</th>
+              <th>已拍</th>
+              <th>废片</th>
+              <th>好张</th>
+              <th>待拍</th>
+              <th>曝光 s</th>
+              <th>位移 mm</th>
+              <th>速度 mm/s</th>
+              <th>操作</th>
+            </tr>
           </thead>
           <tbody>
-            <tr v-for="p in props" :key="p.id">
-              <td>{{ p.name }}</td>
-              <td class="mono">{{ p.fromFrame }} – {{ p.toFrame }}</td>
-              <td>{{ p.posX }}</td>
-              <td>{{ p.posY }}</td>
-              <td>{{ p.posZ }}</td>
-              <td>{{ p.rotation }}°</td>
-              <td>{{ p.fixation }}</td>
-              <td><button type="button" class="btn tiny danger" @click="removeProp(p.id)">删除</button></td>
+            <tr v-for="frame in frames" :key="frame.uid" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
+              <td class="mono">{{ frame.frameNo }}</td>
+              <td><input class="label-input" type="text" maxlength="12" :value="frame.label" @change="editLabel(frame, ($event.target as HTMLInputElement).value)" @click.stop /></td>
+              <td>
+                <input
+                  class="count-input"
+                  type="number"
+                  min="1"
+                  max="99"
+                  step="1"
+                  :value="frame.shotCount"
+                  :data-testid="`cell-count-${frame.frameNo}`"
+                  @change="changeCount(frame, ($event.target as HTMLInputElement).value)"
+                  @click.stop
+                />
+              </td>
+              <td>{{ cellLedgers[frame.uid].taken }}</td>
+              <td :class="{ warn: cellLedgers[frame.uid].wasted > 0 }">{{ cellLedgers[frame.uid].wasted }}</td>
+              <td>{{ cellLedgers[frame.uid].good }}</td>
+              <td>
+                <strong :class="{ done: cellLedgers[frame.uid].remaining === 0, warn: cellLedgers[frame.uid].remaining > 0 }">
+                  {{ cellLedgers[frame.uid].remaining }}
+                </strong>
+                <span v-if="cellLedgers[frame.uid].excess > 0" class="pickup-flag">超 {{ cellLedgers[frame.uid].excess }}</span>
+              </td>
+              <td><input type="number" min="0.008" max="8" step="0.008" :value="frame.exposureSec" @change="editCell(frame, 'exposureSec', ($event.target as HTMLInputElement).value)" @click.stop /></td>
+              <td><input type="number" min="-200" max="200" step="0.5" :value="frame.propOffsetMm" @change="editCell(frame, 'propOffsetMm', ($event.target as HTMLInputElement).value)" @click.stop /></td>
+              <td class="muted">{{ speedOf(frame) }}</td>
+              <td class="row-actions">
+                <button type="button" class="btn tiny" @click.stop="focusRegister(frame)">登记</button>
+                <button type="button" class="btn tiny danger" data-testid="remove-cell" @click.stop="removeFrameRow(frame.frameNo)">移除</button>
+              </td>
             </tr>
           </tbody>
         </table>
-        <EmptyState v-else title="还没有道具状态" description="填写道具名与帧区间后登记，即可在帧序条带上按帧查询位置。" />
+        <EmptyState v-else title="该镜头条带上还没有格子" description="点击「在选中格后插入」按当前曝光参数生成第一格。" action-text="插入一格" @action="addFrameWithExposure" />
+      </div>
+
+      <div class="two-panel">
+        <div class="panel">
+          <div class="panel-head"><h2>本镜头实拍流水</h2><span class="muted">共 {{ shotTakes.length }} 条，按日期倒序</span></div>
+          <table v-if="shotTakes.length" class="table" data-testid="shot-take-table">
+            <thead>
+              <tr><th>日期</th><th>格子</th><th>实拍</th><th>废片</th><th>备注</th><th>登记时间</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in shotTakes" :key="row.id">
+                <td class="mono">{{ row.date }}</td>
+                <td>
+                  <template v-if="row.frameUid">{{ row.frameLabel }}<span class="muted">（原第 {{ row.frameNo }} 格）</span></template>
+                  <span v-else class="muted">旧版整天记录</span>
+                </td>
+                <td>{{ row.takenFrames }}</td>
+                <td :class="{ warn: row.wastedFrames > 0 }">{{ row.wastedFrames }}</td>
+                <td class="muted">{{ row.note || '—' }}</td>
+                <td class="muted">{{ formatDateTime(row.updatedAt) }}</td>
+                <td><button type="button" class="btn tiny danger" @click="deleteTake(row.id)">删除</button></td>
+              </tr>
+            </tbody>
+          </table>
+          <EmptyState v-else title="还没有实拍登记" description="在上方选择格子逐格登记，废片会自动重算进待拍。" />
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>道具轨迹</h2><span class="muted">按帧区间登记道具位置，条带上按位次可查</span></div>
+          <div class="prop-form">
+            <label class="field"><span>道具名</span><input v-model="propForm.name" type="text" maxlength="20" data-testid="prop-name" /></label>
+            <label class="field"><span>起始帧</span><input v-model.number="propForm.fromFrame" type="number" min="1" step="1" data-testid="prop-from" /></label>
+            <label class="field"><span>结束帧</span><input v-model.number="propForm.toFrame" type="number" min="1" step="1" data-testid="prop-to" /></label>
+            <label class="field"><span>X mm</span><input v-model.number="propForm.posX" type="number" step="0.5" /></label>
+            <label class="field"><span>Y mm</span><input v-model.number="propForm.posY" type="number" step="0.5" /></label>
+            <label class="field"><span>Z mm</span><input v-model.number="propForm.posZ" type="number" step="0.5" /></label>
+            <label class="field"><span>旋转 °</span><input v-model.number="propForm.rotation" type="number" step="1" /></label>
+            <label class="field">
+              <span>固定方式</span>
+              <select v-model="propForm.fixation">
+                <option v-for="f in fixationOptions" :key="f" :value="f">{{ f }}</option>
+              </select>
+            </label>
+            <button type="button" class="btn primary" data-testid="prop-submit" @click="addProp">登记道具</button>
+          </div>
+
+          <table v-if="props.length" class="table" data-testid="prop-table">
+            <thead>
+              <tr><th>道具</th><th>帧区间</th><th>X</th><th>Y</th><th>Z</th><th>旋转</th><th>固定</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="p in props" :key="p.id">
+                <td>{{ p.name }}</td>
+                <td class="mono">{{ p.fromFrame }} – {{ p.toFrame }}</td>
+                <td>{{ p.posX }}</td>
+                <td>{{ p.posY }}</td>
+                <td>{{ p.posZ }}</td>
+                <td>{{ p.rotation }}°</td>
+                <td>{{ p.fixation }}</td>
+                <td><button type="button" class="btn tiny danger" @click="removeProp(p.id)">删除</button></td>
+              </tr>
+            </tbody>
+          </table>
+          <EmptyState v-else title="还没有道具状态" description="填写道具名与帧区间后登记，即可在帧序条带上按位次查询位置。" />
+        </div>
       </div>
     </template>
   </section>
@@ -505,7 +590,6 @@ h1 .mono {
 .kv select,
 .table input,
 .table select,
-.take-form input,
 .prop-form input,
 .prop-form select {
   height: 30px;
@@ -515,8 +599,17 @@ h1 .mono {
   font-size: 13px;
   background: #fff;
   color: #1f2d3d;
-  width: 100%;
   box-sizing: border-box;
+}
+.table input[type='text'],
+.table input[type='number'] {
+  width: 100%;
+}
+.label-input {
+  min-width: 84px;
+}
+.count-input {
+  max-width: 64px;
 }
 .table {
   width: 100%;
@@ -528,6 +621,7 @@ h1 .mono {
   text-align: left;
   padding: 8px 6px;
   border-bottom: 1px solid #eef1f6;
+  vertical-align: middle;
 }
 .table th {
   color: #6b7686;
@@ -544,6 +638,34 @@ h1 .mono {
   color: #8a94a6;
   font-size: 12px;
 }
+.sub-line {
+  margin: 10px 0 0;
+}
+.warn {
+  color: #b36a00;
+}
+.strong {
+  font-weight: 700;
+}
+.done {
+  color: #227a52;
+}
+.pickup-flag {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #b36a00;
+  background: #fff3dc;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.tag {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #8a94a6;
+  background: #eef1f6;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
 .prop-lookup {
   margin-top: 10px;
   display: flex;
@@ -559,7 +681,6 @@ h1 .mono {
   padding: 2px 10px;
   font-size: 12px;
 }
-.take-form,
 .prop-form {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -578,6 +699,11 @@ h1 .mono {
   display: flex;
   gap: 6px;
 }
+.actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
 .btn {
   height: 32px;
   padding: 0 14px;
@@ -593,11 +719,6 @@ h1 .mono {
   border-color: #2f6fed;
   color: #fff;
 }
-.btn.small {
-  height: 28px;
-  padding: 0 10px;
-  font-size: 12px;
-}
 .btn.tiny {
   height: 24px;
   padding: 0 8px;
@@ -607,10 +728,6 @@ h1 .mono {
   color: #c45656;
   border-color: #f0c8c8;
 }
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
 .feedback {
   margin: 0;
   background: #eef6ff;
@@ -619,5 +736,8 @@ h1 .mono {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.pickup-panel {
+  border-color: #f0d9b0;
 }
 </style>

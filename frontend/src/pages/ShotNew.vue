@@ -92,7 +92,16 @@ async function submit() {
       status: draft.value.status,
       owner: draft.value.owner.trim(),
     });
-    const first: FrameEntry = { ...createEmptyFrame(shot.id as number, shot.startFrame), ...exposure.value, id: undefined };
+    const seed = createEmptyFrame(shot.id as number, shot.startFrame);
+    const first: FrameEntry = {
+      ...seed,
+      ...exposure.value,
+      id: undefined,
+      uid: seed.uid,
+      frameNo: shot.startFrame,
+      label: `第${shot.startFrame}格`,
+      active: true,
+    };
     await addFrames([first]);
     await frameStore.loadForShot(shot.id as number);
     reset();

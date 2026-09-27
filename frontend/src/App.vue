@@ -19,8 +19,8 @@ function isActive(path: string): boolean {
       <div class="brand">
         <span class="logo">帧</span>
         <div class="brand-text">
-          <strong>定格动画拍摄帧序编排台</strong>
-          <small>镜头拆分 · 帧序编排 · 曝光与道具位移记录</small>
+          <strong>定格动画逐帧拍摄台账</strong>
+          <small>逐格已拍/废片 · 废片重计待拍 · 超量进补拍清单</small>
         </div>
       </div>
       <nav class="nav">

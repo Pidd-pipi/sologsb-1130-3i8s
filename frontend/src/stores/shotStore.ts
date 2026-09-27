@@ -5,8 +5,6 @@ import { toPlain } from '../db';
 import { buildFrameRange, framesToDuration } from '../utils/frameMath';
 import type { Shot } from '../types/shot';
 import { createEmptyShot } from '../types/shot';
-import type { FrameEntry } from '../types/frame';
-import { createEmptyFrame } from '../types/frame';
 
 interface ShotState {
   shots: Shot[];
@@ -77,7 +75,7 @@ export const useShotStore = defineStore('shot', {
       this.shots = this.shots.map((s) => (s.id === id ? { ...next, id } : s));
       await this.rerangeFrames(id);
     },
-    /** 把帧序号重新压缩进 [startFrame, endFrame]，并重算时长 */
+    /** 把条带格子位次重新压缩进 [startFrame, endFrame]，并重算时长（uid 不变，只改 frameNo） */
     async rerangeFrames(shotId: number) {
       const shot = this.shots.find((s) => s.id === shotId);
       if (!shot) return;
@@ -86,14 +84,14 @@ export const useShotStore = defineStore('shot', {
         .slice()
         .sort((a, b) => a.frameNo - b.frameNo)
         .map((row, idx) => ({ ...row, frameNo: shot.startFrame + idx }));
-      await api.updateFrames(next);
+      await api.renumberFrames(next);
     },
     async setStatus(id: number, status: Shot['status']) {
       await api.updateShot(id, { status });
       this.shots = this.shots.map((s) => (s.id === id ? { ...s, status, updatedAt: Date.now() } : s));
     },
     async syncProgress(id: number, percent: number) {
-      await api.syncShotProgress(id, percent);
+      await api.updateShot(id, { progressPercent: percent });
       this.shots = this.shots.map((s) => (s.id === id ? { ...s, progressPercent: percent } : s));
     },
     async remove(id: number) {
@@ -107,9 +105,3 @@ export const useShotStore = defineStore('shot', {
     },
   },
 });
-
-/** 新建镜头时生成首个帧条目 */
-export function firstFrameOf(shot: Shot): FrameEntry {
-  const frame = createEmptyFrame(shot.id ?? 0, shot.startFrame);
-  return frame;
-}

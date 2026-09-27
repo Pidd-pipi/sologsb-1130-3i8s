@@ -1,166 +1,260 @@
 <script setup lang="ts">
 /**
- * 实拍记录：登记当日实拍张数与废帧数，自动回写镜头完成百分比并提示剩余张数。
- * 消费 TakeLog、Shot；复用 ShotProgress 与 useProgress。
+ * 实拍记录 / 补拍清单：
+ * - 逐格登记实拍与废片（登记后该格、镜头、总览进度一起变化，废片重计待拍）；
+ * - 每日实拍台账：按「镜头 + 日期」汇总，原有按整天登记的历史记录照常显示；
+ * - 补拍清单：张数下调、多拍、格子移除产生的超量好张，核销前一直挂账。
+ * 消费 TakeLog、PickupItem、Shot、FrameEntry。
  */
 import { computed, onMounted, ref } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
-import { useProgress } from '../hooks/useProgress';
+import { useLedgerStore } from '../stores/ledgerStore';
 import { formatDateTime, today } from '../utils/format';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
+import RegisterTakeForm from '../components/common/RegisterTakeForm.vue';
+import { PICKUP_REASON_LABEL } from '../types/take';
 import type { TakeLog } from '../types/take';
 
 const shotStore = useShotStore();
+const ledgerStore = useLedgerStore();
 const { shots } = storeToRefs(shotStore);
-const { takes, summaries, overall, wasteBuckets, loadTakes, registerTake, removeTake, loading } = useProgress();
+const { openPickups, resolvedPickups, loading } = storeToRefs(ledgerStore);
 
 const selectedShotId = ref<number | null>(null);
-const form = ref({ date: today(), takenFrames: 8, wastedFrames: 0 });
-const feedback = ref('');
-
-const selectedShot = computed(() => (selectedShotId.value === null ? undefined : shotStore.byId(selectedShotId.value)));
-const selectedSummary = computed(() => summaries.value.find((s) => s.shotId === selectedShotId.value));
+const showArchive = ref(false);
 
 onMounted(async () => {
   if (!shotStore.ready) await shotStore.load();
-  await loadTakes();
+  if (!ledgerStore.ready) await ledgerStore.load();
   const first = shots.value[0];
   if (first && typeof first.id === 'number') selectedShotId.value = first.id;
 });
 
-function flash(text: string) {
-  feedback.value = text;
-  window.setTimeout(() => {
-    if (feedback.value === text) feedback.value = '';
-  }, 3200);
+const selectedShot = computed(() => (selectedShotId.value === null ? undefined : shotStore.byId(selectedShotId.value)));
+const selectedFrames = computed(() =>
+  selectedShotId.value === null ? [] : ledgerStore.framesOfShot(selectedShotId.value),
+);
+const selectedStat = computed(() => (selectedShotId.value === null ? undefined : ledgerStore.shotStat(selectedShotId.value)));
+const overall = computed(() => ledgerStore.overall);
+
+interface DailyRow {
+  key: string;
+  date: string;
+  shotId: number;
+  shotCode: string;
+  taken: number;
+  wasted: number;
+  good: number;
+  count: number;
+  rows: TakeLog[];
 }
 
-async function submit() {
-  const shot = selectedShot.value;
-  if (!shot) {
-    flash('请先选择镜头');
-    return;
+/** 每日实拍台账：同镜头同一天的逐格登记合并为一行，点开看明细 */
+const dailyRows = computed<DailyRow[]>(() => {
+  const map = new Map<string, DailyRow>();
+  for (const t of ledgerStore.takes) {
+    const key = `${t.shotId}@${t.date}`;
+    const row = map.get(key);
+    const taken = t.takenFrames || 0;
+    const wasted = t.wastedFrames || 0;
+    if (row) {
+      row.taken += taken;
+      row.wasted += wasted;
+      row.good += taken - wasted;
+      row.count += 1;
+      row.rows.push(t);
+    } else {
+      map.set(key, {
+        key,
+        date: t.date,
+        shotId: t.shotId,
+        shotCode: t.shotCode,
+        taken,
+        wasted,
+        good: taken - wasted,
+        count: 1,
+        rows: [t],
+      });
+    }
   }
-  const taken = Math.max(0, Math.floor(form.value.takenFrames));
-  const wasted = Math.max(0, Math.floor(form.value.wastedFrames));
-  if (taken <= 0) {
-    flash('实拍张数需大于 0');
-    return;
-  }
-  if (wasted > taken) {
-    flash('废帧数不能多于实拍张数');
-    return;
-  }
-  await registerTake(shot, form.value.date, taken, wasted);
-  await loadTakes();
-  flash(`${shot.code} 已登记 ${taken} 张，完成度回写为 ${selectedSummary.value?.percent ?? 0}%`);
+  return [...map.values()].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : a.shotCode.localeCompare(b.shotCode)));
+});
+
+const expanded = ref<Set<string>>(new Set());
+function toggle(key: string) {
+  const next = new Set(expanded.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  expanded.value = next;
+}
+
+function frameLabelOf(t: TakeLog): string {
+  if (!t.frameUid) return '整天汇总（旧记录）';
+  const frame = ledgerStore.frames.find((f) => f.uid === t.frameUid);
+  if (!frame) return `${t.frameLabel}（已删除）`;
+  return frame.active ? `${frame.label}（第 ${frame.frameNo} 格）` : `${frame.label}（已移出条带）`;
 }
 
 async function removeRow(row: TakeLog) {
   if (typeof row.id !== 'number') return;
-  await removeTake(row.id);
-  await loadTakes();
-  flash('已删除该条实拍记录');
+  await ledgerStore.removeTake(row.id);
 }
+
+async function resolvePickup(id: number | undefined) {
+  if (typeof id !== 'number') return;
+  await ledgerStore.resolvePickup(id);
+}
+
+function onRegistered() {
+  /* 进度由 store 响应式更新，无需额外处理 */
+}
+
+const openPickupTotal = computed(() => openPickups.value.reduce((s, p) => s + p.liveExcess, 0));
+const isToday = (date: string) => date === today();
 </script>
 
 <template>
   <section class="page">
     <header class="page-head">
       <div>
-        <h1>实拍记录</h1>
-        <p class="sub">登记当日实拍张数与废帧数，自动回写镜头完成百分比并提示剩余张数</p>
+        <h1>实拍记录 · 补拍清单</h1>
+        <p class="sub">逐格登记已拍与废片，废片自动重算进待拍；每日按镜头汇总，原有整天记录照常使用</p>
       </div>
       <div class="stat-inline">
-        <span>全片完成度</span>
-        <strong>{{ overall.percent }}%</strong>
-        <span>待拍 {{ overall.remaining }} 张</span>
+        <span>全片待拍 <strong>{{ overall.remaining }}</strong> 张</span>
+        <span>补拍清单 <strong class="warn">{{ openPickups.length }}</strong> 条 / {{ openPickupTotal }} 张</span>
       </div>
     </header>
 
-    <p v-if="feedback" class="feedback" data-testid="take-feedback">{{ feedback }}</p>
-
-    <EmptyState v-if="!shots.length" title="还没有镜头" description="请先到「新建镜头」创建镜头，再登记实拍张数。" />
+    <EmptyState v-if="!shots.length" title="还没有镜头" description="请先到「新建镜头」创建镜头，再逐格登记实拍。" />
 
     <template v-else>
       <div class="two-panel">
         <div class="panel">
-          <div class="panel-head"><h2>登记实拍</h2><StatusTag v-if="selectedShot" :status="selectedShot.status" /></div>
-          <div class="form-grid">
-            <label class="field">
-              <span>镜头</span>
-              <select v-model.number="selectedShotId" data-testid="take-shot-select">
-                <option v-for="s in shots" :key="s.id" :value="s.id">{{ s.code }} · {{ s.sceneName }}</option>
-              </select>
-            </label>
-            <label class="field"><span>拍摄日期</span><input v-model="form.date" type="date" data-testid="take-log-date" /></label>
-            <label class="field">
-              <span>实拍张数</span>
-              <input v-model.number="form.takenFrames" type="number" min="1" max="2000" step="1" data-testid="take-log-taken" />
-            </label>
-            <label class="field">
-              <span>废帧数</span>
-              <input v-model.number="form.wastedFrames" type="number" min="0" max="500" step="1" data-testid="take-log-wasted" />
-            </label>
+          <div class="panel-head">
+            <h2>逐格登记实拍</h2>
+            <select v-model.number="selectedShotId" class="shot-select" data-testid="take-shot-select">
+              <option v-for="s in shots" :key="s.id" :value="s.id">{{ s.code }} · {{ s.sceneName }}</option>
+            </select>
           </div>
-          <div class="actions">
-            <button type="button" class="btn primary" data-testid="take-log-submit" @click="submit">登记实拍</button>
-            <span class="muted" v-if="selectedSummary">
-              计划 {{ selectedSummary.planned }} 张 · 已拍 {{ selectedSummary.taken }} 张 · 剩余 {{ selectedSummary.remaining }} 张
-            </span>
-          </div>
+          <RegisterTakeForm
+            v-if="selectedShot && selectedFrames.length"
+            :key="selectedShotId ?? 'none'"
+            :shot="selectedShot"
+            :frames="selectedFrames"
+            @registered="onRegistered"
+          />
+          <EmptyState v-else title="该镜头条带上还没有格子" description="到镜头详情或帧序编排台插入格子后，再逐格登记。" />
         </div>
 
         <div class="panel">
-          <div class="panel-head"><h2>当前镜头进度</h2><span class="muted">{{ loading ? '读取中…' : '数据来自 IndexedDB' }}</span></div>
-          <ShotProgress
-            v-if="selectedSummary"
-            :code="selectedSummary.code"
-            :status="selectedShot?.status ?? ''"
-            :planned="selectedSummary.planned"
-            :taken="selectedSummary.taken"
-            :wasted="selectedSummary.wasted"
-            :remaining="selectedSummary.remaining"
-            :percent="selectedSummary.percent"
-          />
-          <p v-else class="muted">请选择镜头。</p>
-
-          <div class="waste">
-            <div class="waste-title">废帧分布（按每条记录的张数分桶）</div>
-            <div class="waste-bars">
-              <div v-for="b in wasteBuckets" :key="b.label" class="waste-item">
-                <span class="waste-label">{{ b.label }}</span>
-                <div class="waste-bar"><div class="waste-fill" :style="{ width: Math.min(100, b.count * 20) + '%' }"></div></div>
-                <span class="waste-count">{{ b.count }} 条</span>
-              </div>
-            </div>
+          <div class="panel-head">
+            <h2>当前镜头进度</h2>
+            <StatusTag v-if="selectedShot" :status="selectedShot.status" />
           </div>
+          <ShotProgress
+            v-if="selectedStat"
+            :code="selectedShot?.code ?? ''"
+            :status="selectedShot?.status ?? ''"
+            :planned="selectedStat.required"
+            :taken="selectedStat.good"
+            :wasted="selectedStat.wasted"
+            :remaining="selectedStat.remaining"
+            :percent="selectedStat.percent"
+          />
+          <ul v-if="selectedStat" class="facts">
+            <li>条带 {{ selectedStat.totalFrames }} 格，已拍齐 {{ selectedStat.doneFrames }} 格</li>
+            <li>累计实拍 {{ selectedStat.taken }} 张（含废片 {{ selectedStat.wasted }} 张）</li>
+            <li v-if="selectedStat.excess > 0" class="warn">超量好张 {{ selectedStat.excess }} 张已进补拍清单</li>
+            <li v-if="selectedStat.unassignedGood > 0" class="muted">另有旧版整天记录好张 {{ selectedStat.unassignedGood }} 张，不对格冲抵</li>
+          </ul>
         </div>
       </div>
 
-      <div class="panel">
-        <div class="panel-head"><h2>实拍记录清单</h2><span class="muted">共 {{ takes.length }} 条</span></div>
-        <table v-if="takes.length" class="table" data-testid="take-table">
+      <div class="panel pickup-panel">
+        <div class="panel-head">
+          <h2>补拍清单（{{ openPickups.length }}）</h2>
+          <span class="muted">张数下调 / 多拍 / 格子移除产生的超量好张，不核销不消失</span>
+        </div>
+        <table v-if="openPickups.length" class="table" data-testid="pickup-table">
           <thead>
-            <tr><th>拍摄日期</th><th>镜号</th><th>实拍张数</th><th>废帧数</th><th>剩余张数</th><th>完成百分比</th><th>登记时间</th><th>操作</th></tr>
+            <tr><th>镜头</th><th>格子</th><th>原因</th><th>超量好张</th><th>计数方式</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="row in takes" :key="row.id">
-              <td class="mono">{{ row.date }}</td>
-              <td class="mono">{{ row.shotCode }}</td>
-              <td>{{ row.takenFrames }}</td>
-              <td>{{ row.wastedFrames }}</td>
-              <td>{{ row.remainingFrames }}</td>
-              <td>{{ row.percent }}%</td>
-              <td class="muted">{{ formatDateTime(row.updatedAt) }}</td>
-              <td><button type="button" class="btn tiny danger" @click="removeRow(row)">删除</button></td>
+            <tr v-for="p in openPickups" :key="p.id">
+              <td class="mono">{{ p.shotCode }}</td>
+              <td>
+                {{ p.frameLabel }}
+                <span v-if="p.reason === 'removed'" class="tag">已移出条带</span>
+              </td>
+              <td>{{ PICKUP_REASON_LABEL[p.reason] }}</td>
+              <td class="warn strong">{{ p.liveExcess }} 张</td>
+              <td class="muted">{{ p.reason === 'removed' ? '移除时固定快照' : '随该格计划实时重算' }}</td>
+              <td><button type="button" class="btn tiny" data-testid="pickup-resolve" @click="resolvePickup(p.id)">核销归档</button></td>
             </tr>
           </tbody>
         </table>
-        <EmptyState v-else title="还没有实拍记录" description="在上方选择镜头并登记当日实拍张数。" />
+        <EmptyState v-else title="补拍清单为空" description="张数下调、登记多拍或移除已拍格子时，超量好张会自动留在这里。" />
+        <div v-if="resolvedPickups.length" class="archive-toggle">
+          <button type="button" class="link-btn" @click="showArchive = !showArchive">
+            {{ showArchive ? '收起' : '查看' }}已归档（{{ resolvedPickups.length }}）
+          </button>
+        </div>
+        <table v-if="showArchive && resolvedPickups.length" class="table archive">
+          <thead>
+            <tr><th>镜头</th><th>格子</th><th>原因</th><th>归档时超量</th><th>核销时间</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in resolvedPickups" :key="p.id">
+              <td class="mono">{{ p.shotCode }}</td>
+              <td>{{ p.frameLabel }}</td>
+              <td>{{ PICKUP_REASON_LABEL[p.reason] }}</td>
+              <td>{{ p.excess }} 张</td>
+              <td class="muted">{{ formatDateTime(p.updatedAt) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>每日实拍台账</h2>
+          <span class="muted">{{ loading ? '读取中…' : '按镜头 + 日期汇总，点击行展开逐格明细' }}</span>
+        </div>
+        <table v-if="dailyRows.length" class="table" data-testid="take-table">
+          <thead>
+            <tr><th>拍摄日期</th><th>镜号</th><th>登记条数</th><th>实拍张数</th><th>废片</th><th>好张</th><th>明细</th></tr>
+          </thead>
+          <tbody>
+            <template v-for="d in dailyRows" :key="d.key">
+              <tr class="daily-head" @click="toggle(d.key)">
+                <td class="mono">
+                  {{ d.date }}
+                  <span v-if="isToday(d.date)" class="today">今天</span>
+                </td>
+                <td class="mono">{{ d.shotCode }}</td>
+                <td>{{ d.count }} 条</td>
+                <td>{{ d.taken }}</td>
+                <td :class="{ warn: d.wasted > 0 }">{{ d.wasted }}</td>
+                <td>{{ d.good }}</td>
+                <td><button type="button" class="btn tiny" @click.stop="toggle(d.key)">{{ expanded.has(d.key) ? '收起' : '展开' }}</button></td>
+              </tr>
+              <template v-if="expanded.has(d.key)">
+                <tr v-for="row in d.rows" :key="row.id" class="detail-row">
+                  <td class="muted mono">{{ formatDateTime(row.updatedAt) }}</td>
+                  <td colspan="3">{{ frameLabelOf(row) }}<span v-if="row.note" class="muted"> · {{ row.note }}</span></td>
+                  <td class="muted">废 {{ row.wastedFrames }}</td>
+                  <td>{{ row.takenFrames - row.wastedFrames }} 好张</td>
+                  <td><button type="button" class="btn tiny danger" @click="removeRow(row)">删除</button></td>
+                </tr>
+              </template>
+            </template>
+          </tbody>
+        </table>
+        <EmptyState v-else title="还没有实拍记录" description="在上方选择镜头与格子，登记本次实拍张数与废片。" />
       </div>
     </template>
   </section>
@@ -189,14 +283,17 @@ h1 {
 }
 .stat-inline {
   display: flex;
-  gap: 10px;
+  gap: 14px;
   align-items: baseline;
   font-size: 13px;
   color: #5a6472;
 }
 .stat-inline strong {
-  font-size: 20px;
+  font-size: 18px;
   color: #2f6fed;
+}
+.stat-inline strong.warn {
+  color: #b36a00;
 }
 .two-panel {
   display: grid;
@@ -214,75 +311,36 @@ h1 {
   border-radius: 10px;
   padding: 16px;
 }
+.pickup-panel {
+  border-color: #f0d9b0;
+}
 .panel-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 12px;
+  gap: 10px;
 }
 .panel-head h2 {
   margin: 0;
   font-size: 16px;
 }
-.form-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 10px;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: #5a6472;
-}
-.field input,
-.field select {
-  height: 32px;
+.shot-select {
+  height: 30px;
   border: 1px solid #cfd6e0;
   border-radius: 6px;
   padding: 0 8px;
   font-size: 13px;
   background: #fff;
-  color: #1f2d3d;
 }
-.actions {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-.waste {
-  margin-top: 18px;
-}
-.waste-title {
+.facts {
+  margin: 12px 0 0;
+  padding-left: 18px;
   font-size: 13px;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-.waste-bars {
+  color: #3d4757;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-.waste-item {
-  display: grid;
-  grid-template-columns: 70px 1fr 60px;
-  gap: 8px;
-  align-items: center;
-  font-size: 12px;
-  color: #5a6472;
-}
-.waste-bar {
-  height: 8px;
-  background: #edf0f5;
-  border-radius: 6px;
-  overflow: hidden;
-}
-.waste-fill {
-  height: 100%;
-  background: #d99b2b;
+  gap: 4px;
 }
 .table {
   width: 100%;
@@ -294,11 +352,26 @@ h1 {
   text-align: left;
   padding: 8px 6px;
   border-bottom: 1px solid #eef1f6;
+  vertical-align: middle;
 }
 .table th {
   color: #6b7686;
   font-weight: 600;
   font-size: 12px;
+}
+.daily-head {
+  cursor: pointer;
+}
+.daily-head:hover {
+  background: #f7faff;
+}
+.detail-row td {
+  background: #fafbfd;
+  font-size: 12px;
+}
+.archive {
+  margin-top: 10px;
+  opacity: 0.85;
 }
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -306,6 +379,28 @@ h1 {
 .muted {
   color: #8a94a6;
   font-size: 12px;
+}
+.warn {
+  color: #b36a00;
+}
+.strong {
+  font-weight: 700;
+}
+.today {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #227a52;
+  background: #e4f5ec;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.tag {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #8a94a6;
+  background: #eef1f6;
+  border-radius: 999px;
+  padding: 1px 8px;
 }
 .btn {
   height: 32px;
@@ -317,11 +412,6 @@ h1 {
   cursor: pointer;
   font-size: 13px;
 }
-.btn.primary {
-  background: #2f6fed;
-  border-color: #2f6fed;
-  color: #fff;
-}
 .btn.tiny {
   height: 24px;
   padding: 0 8px;
@@ -331,13 +421,15 @@ h1 {
   color: #c45656;
   border-color: #f0c8c8;
 }
-.feedback {
-  margin: 0;
-  background: #eef6ff;
-  border: 1px solid #d3e4ff;
-  color: #24559c;
-  border-radius: 8px;
-  padding: 8px 12px;
-  font-size: 13px;
+.archive-toggle {
+  margin-top: 10px;
+}
+.link-btn {
+  border: none;
+  background: none;
+  color: #2f6fed;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
 }
 </style>

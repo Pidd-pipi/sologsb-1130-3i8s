@@ -8,7 +8,7 @@ import { initDb } from './db/api';
 import './style.css';
 
 async function bootstrap() {
-  // 打开 IndexedDB（含 v1→v2→v3 升级迁移），失败不阻塞首屏渲染
+  // 打开 IndexedDB（含 v1→v2→v3→v4 升级迁移），失败不阻塞首屏渲染
   try {
     await initDb();
   } catch (e) {

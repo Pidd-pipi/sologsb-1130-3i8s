@@ -22,7 +22,7 @@ export const navItems: { path: string; label: string }[] = [
   { path: '/shots/new', label: '新建镜头' },
   { path: '/frames', label: '帧序编排台' },
   { path: '/props', label: '道具位移轨迹' },
-  { path: '/progress', label: '实拍记录' },
+  { path: '/progress', label: '实拍·补拍台账' },
 ];
 
 const router = createRouter({
@@ -32,8 +32,8 @@ const router = createRouter({
 });
 
 router.afterEach((to) => {
-  const title = (to.meta.title as string | undefined) ?? '定格动画拍摄帧序编排台';
-  document.title = `${title} · 定格动画拍摄帧序编排台`;
+  const title = (to.meta.title as string | undefined) ?? '定格动画逐帧拍摄台账';
+  document.title = `${title} · 定格动画逐帧拍摄台账`;
 });
 
 export default router;
