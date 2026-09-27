@@ -3,7 +3,7 @@ export type ShotCount = 1 | 2 | 3;
 
 export const SHOT_COUNT_OPTIONS: ShotCount[] = [1, 2, 3];
 
-/** 帧条目：一帧的曝光参数、道具位移与实拍记录 */
+/** 帧条目：一帧的曝光参数、道具位移与逐帧台账记录 */
 export interface FrameEntry {
   id?: number;
   /** 帧序号，从 1 开始，随排序重排 */
@@ -24,6 +24,10 @@ export interface FrameEntry {
   lighting: string;
   /** 道具位移量（mm） */
   propOffsetMm: number;
+  /** 逐帧台账：已拍张数（含废片） */
+  takenCount: number;
+  /** 逐帧台账：废片张数（重新算进待拍） */
+  wastedCount: number;
   /** 备注 */
   note: string;
   updatedAt: number;
@@ -39,6 +43,8 @@ export const createEmptyFrame = (shotId: number, frameNo: number): FrameEntry =>
   shutterAngle: 180,
   lighting: '主灯 + 柔光箱',
   propOffsetMm: 0,
+  takenCount: 0,
+  wastedCount: 0,
   note: '',
   updatedAt: Date.now(),
 });

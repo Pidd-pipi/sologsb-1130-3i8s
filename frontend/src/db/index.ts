@@ -4,13 +4,14 @@
  *   v1 建 shots / frames
  *   v2 增加 props 表与 shotId 索引
  *   v3 增加 takes 表，并按实拍张数回填进度
+ *   v4 增加 frameTakes 补拍清单表，并为帧条目补齐逐帧台账字段
  */
 import Dexie from 'dexie';
 import type { Table } from 'dexie';
 import type { Shot } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
 import type { PropState } from '../types/prop';
-import type { TakeLog } from '../types/take';
+import type { FrameTake, TakeLog } from '../types/take';
 
 export const DB_NAME = 'gbstopmotion-db';
 
@@ -32,6 +33,7 @@ export class StopMotionDb extends Dexie {
   frames!: Table<FrameEntry, number>;
   props!: Table<PropState, number>;
   takes!: Table<TakeLog, number>;
+  frameTakes!: Table<FrameTake, number>;
 
   constructor() {
     super(DB_NAME);
@@ -72,6 +74,24 @@ export class StopMotionDb extends Dexie {
           const percent = Math.min(100, Math.round((take.takenFrames / total) * 100));
           await tx.table('takes').update(take.id, { percent });
         }
+      });
+    this.version(4)
+      .stores({
+        shots: '++id, code, status, sceneName',
+        frames: '++id, shotId, frameNo, [shotId+frameNo]',
+        props: '++id, shotId, name, [shotId+fromFrame]',
+        takes: '++id, shotId, date, shotCode',
+        frameTakes: '++id, shotId, frameNo',
+      })
+      .upgrade(async (tx) => {
+        // v4：为已有帧条目补齐逐帧台账字段，老数据从 0 开始登记
+        await tx
+          .table('frames')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.takenCount !== 'number') row.takenCount = 0;
+            if (typeof row.wastedCount !== 'number') row.wastedCount = 0;
+          });
       });
   }
 }

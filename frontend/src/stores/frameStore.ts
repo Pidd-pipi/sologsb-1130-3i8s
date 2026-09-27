@@ -87,10 +87,32 @@ export const useFrameStore = defineStore('frame', {
     },
     async removeAt(index: number) {
       if (this.frames.length <= 1) return;
+      const removed = this.frames[index];
       this.frames = this.frames.filter((_, i) => i !== index);
       this.frames = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1 }));
       this.dirty = true;
       await this.persist();
+      await this.snapshotRemoved(removed);
+    },
+    /**
+     * 格子从条带移除时，已拍/废片不随格子消失：
+     * 快照写进补拍清单（frameTakes 表），在逐帧台账页可查可销记。
+     */
+    async snapshotRemoved(removed: FrameEntry | undefined) {
+      if (!removed || this.shotId === null) return;
+      const taken = removed.takenCount ?? 0;
+      const wasted = removed.wastedCount ?? 0;
+      if (taken <= 0 && wasted <= 0) return;
+      const shot = await api.getShot(this.shotId);
+      await api.addFrameTake({
+        shotId: this.shotId,
+        shotCode: shot?.code ?? '',
+        frameNo: removed.frameNo,
+        planned: removed.shotCount,
+        taken,
+        wasted,
+        removedAt: Date.now(),
+      });
     },
     async move(from: number, to: number) {
       if (from === to || from < 0 || to < 0 || from >= this.frames.length || to >= this.frames.length) return;

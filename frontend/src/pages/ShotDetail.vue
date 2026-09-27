@@ -212,6 +212,7 @@ function speedOf(frame: FrameEntry) {
       </div>
       <div class="head-actions">
         <StatusTag v-if="shot" :status="shot.status" />
+        <button type="button" class="btn" @click="router.push({ path: '/ledger', query: { shot: shotId } })">去逐帧台账</button>
         <button type="button" class="btn" @click="router.push('/frames')">去帧序编排台</button>
         <button type="button" class="btn" @click="router.push('/')">返回总览</button>
       </div>

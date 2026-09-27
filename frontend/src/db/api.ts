@@ -3,7 +3,7 @@ import { db, toPlain } from './index';
 import type { Shot } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
 import type { PropState } from '../types/prop';
-import type { TakeLog } from '../types/take';
+import type { FrameTake, TakeLog } from '../types/take';
 
 export async function initDb(): Promise<void> {
   if (!db.isOpen()) await db.open();
@@ -29,10 +29,11 @@ export async function updateShot(id: number, patch: Partial<Shot>): Promise<void
 }
 
 export async function deleteShot(id: number): Promise<void> {
-  await db.transaction('rw', db.shots, db.frames, db.props, db.takes, async () => {
+  await db.transaction('rw', db.shots, db.frames, db.props, db.takes, db.frameTakes, async () => {
     await db.frames.where('shotId').equals(id).delete();
     await db.props.where('shotId').equals(id).delete();
     await db.takes.where('shotId').equals(id).delete();
+    await db.frameTakes.where('shotId').equals(id).delete();
     await db.shots.delete(id);
   });
 }
@@ -132,4 +133,24 @@ export async function deleteTake(id: number): Promise<void> {
 /** 按实拍张数回写镜头进度（Shot 表保存完成百分比快照，便于总览页快速读取） */
 export async function syncShotProgress(shotId: number, percent: number): Promise<void> {
   await db.shots.update(shotId, toPlain({ progressPercent: percent, updatedAt: Date.now() }));
+}
+
+/* ---------------- frameTakes（补拍清单） ---------------- */
+
+export async function listFrameTakes(shotId: number): Promise<FrameTake[]> {
+  const rows = await db.frameTakes.where('shotId').equals(shotId).toArray();
+  return rows.sort((a, b) => b.removedAt - a.removedAt);
+}
+
+export async function listAllFrameTakes(): Promise<FrameTake[]> {
+  const rows = await db.frameTakes.toArray();
+  return rows.sort((a, b) => b.removedAt - a.removedAt);
+}
+
+export async function addFrameTake(row: FrameTake): Promise<number> {
+  return db.frameTakes.add(toPlain(row));
+}
+
+export async function deleteFrameTake(id: number): Promise<void> {
+  await db.frameTakes.delete(id);
 }

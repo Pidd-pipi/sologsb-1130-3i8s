@@ -1,6 +1,6 @@
 # 定格动画拍摄帧序编排台（gbstopmotion）
 
-面向定格动画的动画师与摄影助理，把镜头拆分、逐帧位移量与拍摄参数记录成可执行的拍摄清单：新建镜头后按帧率与时长自动排帧区间，在帧序条带上插入、删除、移动帧并重算时长，随拍随记曝光参数与实拍张数。
+面向定格动画的动画师与摄影助理，把镜头拆分、逐帧位移量与拍摄参数记录成可执行的拍摄清单：新建镜头后按帧率与时长自动排帧区间，在帧序条带上插入、删除、移动帧并重算时长，随拍随记曝光参数与实拍张数；逐帧拍摄台账按每格自己的张数登记已拍与废片，废片重新算进待拍，计划下调或格子移除后的超量已拍保留在补拍清单。
 
 ## Docker 一键启动
 
@@ -40,14 +40,14 @@ sologsb-1130/
     ├── nginx.conf            # try_files $uri $uri/ /index.html + gzip
     ├── public/favicon.svg
     └── src/
-        ├── types/{shot,frame,prop,take}.ts        # 4 个数据模型
+        ├── types/{shot,frame,prop,take}.ts        # 4 个数据模型（take 含补拍清单记录）
         ├── stores/{shotStore,frameStore,uiStore}.ts
         ├── components/common/{FrameStrip,ExposureForm,ShotProgress,StatusTag,EmptyState}.vue
         ├── hooks/{useFrameSequence,useProgress,useLocalDraft}.ts
-        ├── pages/{Overview,ShotNew,ShotDetail,FrameBoard,PropTrack,TakeLog}.vue
+        ├── pages/{Overview,ShotNew,ShotDetail,FrameBoard,FrameLedger,PropTrack,TakeLog}.vue
         ├── router/index.ts
-        ├── utils/{frameMath,exposure,format}.ts
-        └── db/{index,api}.ts                      # Dexie 实例（v1→v3 升级迁移）与读写层
+        ├── utils/{frameMath,exposure,format,ledger}.ts
+        └── db/{index,api}.ts                      # Dexie 实例（v1→v4 升级迁移）与读写层
 ```
 
 ## 页面与路由
@@ -58,12 +58,14 @@ sologsb-1130/
 | `/shots/new` | 新建镜头 | 填写镜号、场景名、帧率与时长，保存后生成帧区间与首位帧条目 |
 | `/shots/:id` | 镜头详情 | 镜头参数与进度、帧序条带、帧条目表格、道具轨迹、登记实拍 |
 | `/frames` | 帧序编排台 | 移动/插入/删除帧、批量套用曝光，改动后重算序号与总时长 |
+| `/ledger` | 逐帧台账 | 每格按自己的张数登记已拍与废片，格/镜头/总览进度联动，补拍清单保留超量与移除格记录 |
 | `/props` | 道具位移轨迹 | 按镜头与帧区间登记 X/Y/Z 与旋转角度，曲线预览累计位移 |
 | `/progress` | 实拍记录 | 登记当日实拍张数与废帧数，回写完成百分比并提示剩余张数 |
 
 ## 数据存储
 
-- **IndexedDB（Dexie，`gbstopmotion-db`）**：镜头、帧条目、道具状态、实拍记录四张表。
-  版本迁移：`v1` 建 `shots` / `frames`；`v2` 增加 `props` 表与 `shotId` 索引；`v3` 增加 `takes` 表并按实拍张数回填进度。
+- **IndexedDB（Dexie，`gbstopmotion-db`）**：镜头、帧条目、道具状态、实拍记录、补拍清单五张表。
+  版本迁移：`v1` 建 `shots` / `frames`；`v2` 增加 `props` 表与 `shotId` 索引；`v3` 增加 `takes` 表并按实拍张数回填进度；`v4` 增加 `frameTakes` 补拍清单表，并为帧条目补齐逐帧台账字段（`takenCount` / `wastedCount`，老数据回填 0）。
+- **逐帧台账**：每格的已拍/废片直接存在帧条目上，切换镜头或刷新页面后仍按原格对应；格子从条带移除时，已拍/废片快照写入 `frameTakes` 补拍清单，不随格子消失；计划张数下调后的超量由帧条目数据推算，同样保留在补拍清单。逐格登记会同步写一条当日实拍记录，镜头与总览进度随之一并回写，废片重新算进待拍。
 - **localStorage**：新建镜头表单与批量曝光参数草稿，键前缀 `gbstopmotion:draft:`。
 - 全部数据存在浏览器本地，容器无状态、不使用数据库服务、不挂载命名卷，无任何后端接口调用。
